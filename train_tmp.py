@@ -28,6 +28,9 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
+import cv2
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -45,9 +48,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_end = torch.cuda.Event(enable_timing = True)
 
     viewpoint_stack = None
+    viewpoint_stack_backup = None
+    viewpoint_stack_backup_name = None
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+
+    save_dir = "output/wait"
+    image_dict = {}
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
     for iteration in range(first_iter, opt.iterations + 1):        
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -74,8 +84,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Pick a random Camera
         if not viewpoint_stack:
+            # viewpoint_stack = scene.getTrainCameras()[:100].copy()
             viewpoint_stack = scene.getTrainCameras().copy()
+        if not viewpoint_stack_backup:
+            viewpoint_stack_backup = viewpoint_stack[:10].copy()
+            viewpoint_stack_backup_name = [cam.image_name for cam in viewpoint_stack_backup]
+
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        # viewpoint_cam = viewpoint_stack.pop(0)
 
         # Render
         if (iteration - 1) == debug_from:
@@ -85,6 +101,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+
+        if viewpoint_cam.image_name in viewpoint_stack_backup_name:
+            image_np = (image.detach().clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy()[..., ::-1] * 255).astype('uint8')
+            image_dict[f"{viewpoint_cam.image_name}"] = image_np
+
+        if iteration % 1000 == 0:
+            if len(image_dict) % 2 == 0:
+                devide_len = len(image_dict) // 2
+                image_up = cv2.hconcat([image_dict[f"{cam.image_name}"] for cam in viewpoint_stack_backup[:devide_len]])
+                image_down = cv2.hconcat([image_dict[f"{cam.image_name}"] for cam in viewpoint_stack_backup[devide_len:]])
+                image_combine = cv2.vconcat([image_up, image_down])
+                cv2.imwrite(f"{save_dir}/{iteration}.png", image_combine)
+            else:
+                image_combine = cv2.hconcat([image_dict[f"{cam.image_name}"] for cam in viewpoint_stack_backup])
+
+        if iteration != 0 and iteration % 10000 == 0:
+            gaussians.prune_points()
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
@@ -200,8 +233,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[i*1000 for i in range(1, 101)])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000, 50_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)

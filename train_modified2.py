@@ -28,6 +28,9 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
+import cv2
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -45,9 +48,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_end = torch.cuda.Event(enable_timing = True)
 
     viewpoint_stack = None
+    circulate_count = -1
+    start, end = 0, 0
+    train_circle, train_interval = 1, 1
+    number = 3
+
+    viewpoint_stack_backup = None
+    viewpoint_stack_backup_name = None
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+
+    save_dir = "output/wait"
+    image_dict = {}
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
     for iteration in range(first_iter, opt.iterations + 1):        
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -75,7 +90,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+            circulate_count += 1
+            # if end == len(viewpoint_stack):
+            #     gaussians.prune_ray_points(opt)
+            #     end = -1
+            # if end >=0 and circulate_count >= 0 and train_circle == train_interval:
+            #     if end > 0:
+            #         gaussians.prune_ray_points(opt)
+            #     start = circulate_count * number
+            #     end = (circulate_count + 1) * number if (circulate_count + 1) * number < len(viewpoint_stack) else len(viewpoint_stack)
+            #     target_names = [viewpoint_stack[i].image_name for i in range(start, end)]
+            #     train_circle = 0
+            # train_circle += 1
+            target_names = [viewpoint_stack[i].image_name for i in range(len(viewpoint_stack))]
+        if not viewpoint_stack_backup:
+            viewpoint_stack_backup = viewpoint_stack[:10].copy()
+            viewpoint_stack_backup_name = [cam.image_name for cam in viewpoint_stack_backup]
+
+        # viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        viewpoint_cam = viewpoint_stack.pop(0)
 
         # Render
         if (iteration - 1) == debug_from:
@@ -88,6 +121,33 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
+
+        ###################################################################
+        # if iteration < len(scene.getTrainCameras()):
+        #     save_d = "output/init_image_debug"
+        #     if not os.path.exists(save_d):
+        #         os.makedirs(save_d)
+        #     image_np = (image.detach().clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy()[..., ::-1] * 255).astype('uint8')
+        #     cv2.imwrite(f"{save_d}/{viewpoint_cam.image_name}.png", image_np)
+
+        if viewpoint_cam.image_name in viewpoint_stack_backup_name:
+            image_np = (image.detach().clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy()[..., ::-1] * 255).astype('uint8')
+            image_dict[f"{viewpoint_cam.image_name}"] = image_np
+        if iteration > 0 and iteration % 500  == 0:
+            if len(image_dict) % 2 == 0:
+                devide_len = len(image_dict) // 2
+                image_up = cv2.hconcat([image_dict[f"{cam.image_name}"] for cam in viewpoint_stack_backup[:devide_len]])
+                image_down = cv2.hconcat([image_dict[f"{cam.image_name}"] for cam in viewpoint_stack_backup[devide_len:]])
+                image_combine = cv2.vconcat([image_up, image_down])
+                cv2.imwrite(f"{save_dir}/{iteration}.png", image_combine)
+            else:
+                image_combine = cv2.hconcat([image_dict[f"{cam.image_name}"] for cam in viewpoint_stack_backup])
+
+        if iteration % 50000 == 0:
+            gaussians.visualize_pnts(viewpoint_stack_backup[0])
+            print("00000000")
+        ###################################################################
+
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         loss.backward()
@@ -105,31 +165,48 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
-            if (iteration in saving_iterations):
-                print("\n[ITER {}] Saving Gaussians".format(iteration))
-                scene.save(iteration)
+            # if (iteration in saving_iterations):
+            #     print("\n[ITER {}] Saving Gaussians".format(iteration))
+            #     scene.save(iteration)
 
             # Densification
+            # if iteration < opt.densify_until_iter and not viewpoint_stack:
             if iteration < opt.densify_until_iter:
+            # if iteration < 30000:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                # if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                if iteration > 10 and iteration % 50 == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    # size_threshold = 20 if iteration > 3000 else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
+                    # gaussians.prune_only(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                # if iteration % 3000 == 0 or (dataset.white_background and iteration == 500):
                     gaussians.reset_opacity()
 
             # Optimizer step
+            # if iteration < opt.iterations and not viewpoint_stack:
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
+                # lall = []
 
-            if (iteration in checkpoint_iterations):
-                print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+            # if (iteration in checkpoint_iterations):
+            #     print("\n[ITER {}] Saving Checkpoint".format(iteration))
+            #     torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+            
+        if iteration > 1 and iteration % 50 == 0 and viewpoint_cam.image_name in target_names:
+            gaussians.prune_ray_points(opt)
+            if len(gaussians.get_xyz) > 0:
+                gaussians.pick_residual_points()
+            print(f"[INFO] name: {viewpoint_cam.image_name}")
+            gaussians.add_raypoints(viewpoint_cam, image, gt_image)
+        torch.cuda.empty_cache()
+
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -200,8 +277,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[i*1000 for i in range(1, 101)])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000, 50_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[1000*i for i in range(1, 50)])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
