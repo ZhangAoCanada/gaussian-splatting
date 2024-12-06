@@ -80,9 +80,9 @@ class CacheDataLoader(torch.utils.data.DataLoader):
             self.generator.manual_seed(seed)
             print("#{} dataloader seed to {}".format(os.getpid(), seed))
 
-    def _cache_data(self, indices: list):
+    def _cache_data(self, cached, indices: list):
         # TODO: speedup image loading
-        cached = []
+        # cached = []
         if self.num_workers > 0:
             with ThreadPoolExecutor(max_workers=self.num_workers) as e:
                 for i in tqdm(
@@ -95,7 +95,7 @@ class CacheDataLoader(torch.utils.data.DataLoader):
             for i in tqdm(indices, desc="#{} loading images (1st: {})".format(os.getpid(), indices[0])):
                 cached.append(self.dataset.__getitem__(i))
 
-        return cached
+        # return cached
 
     def __len__(self) -> int:
         return len(self.indices)
@@ -146,7 +146,10 @@ class CacheDataLoader(torch.utils.data.DataLoader):
                         del cached
                     except:
                         pass
-                    cached = self._cache_data(to_cache)
+
+                    cached = []
+                    self._cache_data(cached, to_cache)
+                    # cached = self._cache_data(cached, to_cache)
 
                     for i in cached:
                         yield i
