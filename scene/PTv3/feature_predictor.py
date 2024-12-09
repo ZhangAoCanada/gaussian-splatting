@@ -7,6 +7,8 @@ from .pointtransformer_v3 import PointTransformerV3Model
 from .spconv import SparseConvModel
 from typing import List
 
+
+
 FEATURE2CHANNEL = {
     'means': 3,
     'features_dc': 3,
@@ -27,17 +29,20 @@ class FeaturePredictor(nn.Module):
                  output_head_nlayer=4,
                  output_head_type='mlp-relu',
                  output_head_width=128,
-                 output_features_type='res', # 'dc:direct component or res:residual"
+                 output_features_type="res", # 'dc:direct component or res:residual"
                  res_feature_activation={
-                    'means': nn.Tanh(),
-                    'features_dc': nn.Identity(),
-                    'features_rest': nn.Identity(),
-                    'scales': nn.Identity(),
-                    'opacities': nn.Identity(),
-                    'quats': nn.Identity(),
-                 },
+                            "means":  nn.Tanh(),
+                            # "means":  nn.Identity(),
+                            "features_dc": nn.Identity(),
+                            "features_rest": nn.Identity(),
+                            "scales": nn.Identity(),
+                            "opacities": nn.Identity(),
+                            "quats": nn.Identity()
+                        },
                  max_scale_normalized=1e-2,
-                 grid_resolution=384,
+                #  grid_resolution=6400,
+                 grid_resolution=9600,
+                #  grid_resolution=384,
                  resume_ckpt=None,
                  input_embed_to_mlp=False,
                  zeroinit=True,
@@ -100,9 +105,13 @@ class FeaturePredictor(nn.Module):
             normalized_gs = {}
             scaler = MinMaxScaler()
             scaler.fit(gs['means'])
-            normalized_gs['means'] = scaler.transform(gs['means']) 
-            normalized_gs['scales'] = gs['scales'] + torch.log(scaler.scale_)
-            normalized_gs['features_dc'] = gs['features_dc']
+            for key in gs:
+                if key=='means':
+                    normalized_gs['means'] = scaler.transform(gs['means']) 
+                elif key == 'scales':
+                    normalized_gs['scales'] = gs['scales'] + torch.log(scaler.scale_)
+                else:
+                    normalized_gs[key] = gs[key]
             scalers.append(scaler)
             batch_normalized_gs.append(normalized_gs)
         return batch_normalized_gs, scalers
@@ -124,8 +133,10 @@ class FeaturePredictor(nn.Module):
     # def forward(self, batch_gs):
     #     #1. Normalize
     #     batch_normalized_gs, batch_scalers = self.normalized_gs(batch_gs) #Move to dataloader part
-    def forward(self, batch_normalized_gs: List, batch_scene_idx: List, 
-                **kwargs):
+    def forward(self, batch_normalized_gs: List, **kwargs):
+        ########## NOTE: normalization ########
+        batch_normalized_gs, normalize_scaler = self.normalized_gs(batch_normalized_gs)
+        #######################################
         # start = time()
         device = batch_normalized_gs[0]['means'].device #It should be cuda
         input_keys = sorted(batch_normalized_gs[0])
@@ -134,12 +145,13 @@ class FeaturePredictor(nn.Module):
         offset = torch.tensor([gs['means'].shape[0] for gs in batch_normalized_gs]).cumsum(0)
         feat = []
         
-        for bi, (gs, idx) in enumerate(zip(batch_normalized_gs, batch_scene_idx)):
+        # for bi, (gs, idx) in enumerate(zip(batch_normalized_gs, batch_scene_idx)):
+        for bi, gs in enumerate(batch_normalized_gs):
             feat_list = []
             for key in self.input_features:
                 if key=='means':
                     feat_list.append(gs[key])
-                elif key == 'features_rest' or key == "features_dc":
+                elif key == 'features_rest' or key == 'features_dc':
                     feat_list.append(gs[key].view(gs[key].shape[0], -1))
                 else:
                     feat_list.append(gs[key])
@@ -173,26 +185,26 @@ class FeaturePredictor(nn.Module):
                 if feature == 'scales' and self.max_scale_normalized>0:
                     feature_o = torch.nn.functional.relu(feature_o)*-1
                     feature_o = feature_o + torch.log(torch.tensor(self.max_scale_normalized))
-                if feature=='features_rest' or key == "features_dc":
+                if feature=='features_rest' or feature=='features_dc':
                     feature_o = feature_o.view(feature_o.shape[0], -1, 3)
                 output[feature] = feature_o
             elif self.output_features_type=='res': #Predict the modulation and residual (mod first and res then)
                 pointer = 0
                 feature_o_res = feature_o[:, pointer:pointer+FEATURE2CHANNEL[feature]]
                 ###########################################################
-                if feature == "scales":
-                    feature_o_res = torch.nn.functional.tanh(feature_o_res)
-                    # feature_o_res = torch.nn.functional.relu(feature_o_res) * -1
-                    # feature_o_res = torch.nn.functional.mish(feature_o_res) * -1
-                    # feature_o_res = torch.nn.functional.gelu(feature_o_res) * -1
+                # if feature == "scales":
+                #     feature_o_res = torch.nn.functional.tanh(feature_o_res)
+                #     # feature_o_res = torch.nn.functional.relu(feature_o_res) * -1
+                #     # feature_o_res = torch.nn.functional.mish(feature_o_res) * -1
+                #     # feature_o_res = torch.nn.functional.gelu(feature_o_res) * -1
                 ###########################################################
                 feature_o_res = self.res_feature_activation[feature](feature_o_res)
                 pointer += FEATURE2CHANNEL[feature]
-                if feature == 'features_rest' or key == "features_dc":
+                if feature == 'features_rest' or feature == 'features_dc':
                     feature_o_res = feature_o_res.view(feature_o_res.shape[0], -1, 3)
                 ###########################################################
-                if feature == "means":
-                    feature_o_res = feature_o_res * 0.1
+                # if feature == "means":
+                #     feature_o_res = feature_o_res * 0.1
                 ###########################################################
                 output[feature] = feature_o_res
 
@@ -217,6 +229,13 @@ class FeaturePredictor(nn.Module):
                 for out_gs, in_gs in zip(out_batch_normalized_gs, batch_normalized_gs):
                     out_gs[key] = in_gs[key]
 
+        ########## NOTE: unormalization ########
+        out_batch_normalized_gs = self.unnormalized_gs(out_batch_normalized_gs, normalize_scaler)
+        ########################################
+
         assert len(out_batch_normalized_gs) == 1, 'Now only support batch size 1'
         return out_batch_normalized_gs
 
+
+
+            

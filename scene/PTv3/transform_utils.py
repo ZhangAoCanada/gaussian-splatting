@@ -54,6 +54,7 @@ class MinMaxScaler:
         self.preserve_ratio = preserve_ratio
         self.already_centered = already_centered
         self.already_scaled = already_scaled
+        self.extend_ratio = 0.05
         if self.already_scaled:
             assert self.already_centered
         assert self.preserve_ratio
@@ -65,7 +66,7 @@ class MinMaxScaler:
             self.data_min_ = torch.min(X, dim=0)[0]
             self.data_max_ = torch.max(X, dim=0)[0]
             self.data_range_ = self.data_max_ - self.data_min_
-            self.data_range_ = self.data_range_ * 1.1 #add a bit of margin
+            self.data_range_ = (1 + self.extend_ratio) * self.data_range_
 
             self.min, self.max = self.feature_range
             self.center = (self.min + self.max) / 2
@@ -94,6 +95,7 @@ class MinMaxScaler:
             self.data_min_ = torch.min(X, dim=0)[0]
             self.data_max_ = torch.max(X, dim=0)[0]
             self.data_range_ = self.data_max_ - self.data_min_
+            self.data_range_ = self.data_range_ * 1.1 #add a bit of margin
 
             self.min, self.max = self.feature_range
             self.center = (self.min + self.max) / 2

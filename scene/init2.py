@@ -86,6 +86,7 @@ class Scene:
                                                            "point_cloud.ply"))
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
+            # self.gaussians.create_from_pcd_new(scene_info.point_cloud, self.cameras_extent)
             # self.gaussians.create_from_random(self.cameras_extent)
 
     def save(self, iteration):
