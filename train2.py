@@ -53,7 +53,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ######## NOTE: build model ###########
     model = FeaturePredictor(sh_degree=dataset.sh_degree)
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    model_path = "models/ptv3_50k.pth"
+    # model_path = "models/ptv3_50k.pth"
+    model_path = "models/ptv3_combine60k.pth"
     if os.path.exists(model_path):
         model.load_state_dict(torch.load(model_path, map_location="cpu")[0])
         print("[INFO] Load model from {}".format(model_path))
@@ -85,8 +86,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter += 1
     # for iteration in range(first_iter, opt.iterations + 1):        
     iteration = first_iter
-    gs_train_iter = 2000
-    net_train_iter = 10000
+    gs_train_iter = 5000
+    net_train_iter = 5000
     while iteration <= opt.iterations:
         for dataset_index, viewpoint_cam in enumerate(gs_dataloader):
             if network_gui.conn == None:

@@ -268,7 +268,7 @@ class GaussianModel:
         self._scaling_tmp = torch.empty(0)
         self._rotation_tmp = torch.empty(0)
 
-    def merge_tmp_param(self, xyz_threshold=0.1):
+    def merge_tmp_param(self, xyz_threshold=0.01):
         mask = torch.zeros((self._xyz_tmp.shape[0]), device="cuda", dtype=bool)
         distance = torch.norm(self._xyz_tmp - self._xyz, dim=1)
         mask = torch.where(distance > xyz_threshold, True, False)
