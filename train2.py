@@ -41,6 +41,7 @@ from scene.PTv3.utils import loss_utils
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, enable_tmp=True):
+    enable_tmp = True
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -84,7 +85,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter += 1
     # for iteration in range(first_iter, opt.iterations + 1):        
     iteration = first_iter
-    iteration_for_1stround = 2000
+    gs_train_iter = 2000
+    net_train_iter = 10000
     while iteration <= opt.iterations:
         for dataset_index, viewpoint_cam in enumerate(gs_dataloader):
             if network_gui.conn == None:
@@ -101,6 +103,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         break
                 except Exception as e:
                     network_gui.conn = None
+            
+            ################ NOTE: merge attributes ################
+            if iteration > 0 and iteration % (gs_train_iter + net_train_iter) == 0:
+                gaussians.merge_tmp_param()
+            gaussians.tmp_remove_param()
+            # if iteration % (gs_train_iter + net_train_iter) <= gs_train_iter:
+            #     model.eval()
+            # else:
+            #     model.train()
+            ########################################################
 
             iter_start.record()
 
@@ -121,8 +133,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-            if iteration > iteration_for_1stround:
-                ########## NOTE: training the model ###########
+            ############### NOTE: training the model ################
+            if iteration % (gs_train_iter + net_train_iter) > gs_train_iter:
                 visibility_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe, bg)
                 # gaussians_visible = gaussians.get_gs_param(visibility_mask)
                 gaussians_visible = gaussians.get_all_gs_param()
@@ -130,9 +142,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     pred_gs = model([gaussians_visible])[0]
                 gaussians.tmp_update_gs_param(pred_gs)
                 render_pkg = render_tmp(viewpoint_cam, gaussians, pipe, bg)
-                ###############################################
             else:
                 render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
+            #########################################################
 
             image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
@@ -145,7 +157,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Ll1 = (image - gt_image).abs().mean()
             # loss = Ll1 + lpips_loss_func(image.permute(1, 2, 0).unsqueeze(0), gt_image.permute(1, 2, 0).unsqueeze(0)).mean() + psnr(image.unsqueeze(0), gt_image.unsqueeze(0)).mean()
             # loss.backward()
-            if iteration > iteration_for_1stround:
+            if iteration % (gs_train_iter + net_train_iter) > gs_train_iter:
                 if enable_tmp:
                     scaler.scale(loss).backward()
                     scaler.step(model_optimizer)
@@ -201,7 +213,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 #     torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
             iteration += 1
-            gaussians.tmp_remove_param()
             if iteration > opt.iterations:
                 break
             

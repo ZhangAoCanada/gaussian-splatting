@@ -267,6 +267,19 @@ class GaussianModel:
         self._opacity_tmp = torch.empty(0)
         self._scaling_tmp = torch.empty(0)
         self._rotation_tmp = torch.empty(0)
+
+    def merge_tmp_param(self, xyz_threshold=0.1):
+        mask = torch.zeros((self._xyz_tmp.shape[0]), device="cuda", dtype=bool)
+        distance = torch.norm(self._xyz_tmp - self._xyz, dim=1)
+        mask = torch.where(distance > xyz_threshold, True, False)
+        new_xyz = self._xyz_tmp.detach().clone()[mask]
+        new_features_dc = self._features_dc_tmp.detach().clone()[mask]
+        new_features_rest = self._features_rest_tmp.detach().clone()[mask]
+        new_opacity = self._opacity_tmp.detach().clone()[mask]
+        new_scaling = self._scaling_tmp.detach().clone()[mask]
+        new_rotation = self._rotation_tmp.detach().clone()[mask]
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+
     ######################################################################
     ######################################################################
     ######################################################################
