@@ -48,10 +48,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gs_dataset = GSDataset(scene.getTrainCameraInfos(), dataset)
     gs_dataloader = CacheDataLoader(gs_dataset, max_cache_num=128, seed=42, shuffle=True, num_workers=8, batch_size=1)
     gs_testset = GSDataset(scene.getTestCameraInfos(), dataset)
-    gs_testloader = CacheDataLoader(gs_testset, max_cache_num=8, seed=42, shuffle=False, num_workers=8, batch_size=1)
+    gs_testloader = CacheDataLoader(gs_testset, max_cache_num=16, seed=42, shuffle=False, num_workers=8, batch_size=1)
     ######## NOTE: build model ###########
     model = FeaturePredictor(sh_degree=dataset.sh_degree)
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    model_path = "models/ptv3_50k.pth"
+    if os.path.exists(model_path):
+        model.load_state_dict(torch.load(model_path, map_location="cpu")[0])
+        print("[INFO] Load model from {}".format(model_path))
     model = model.cuda()
     model.train()
     model_optimizer = build_optimizer(model)
@@ -80,6 +84,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter += 1
     # for iteration in range(first_iter, opt.iterations + 1):        
     iteration = first_iter
+    iteration_for_1stround = 2000
     while iteration <= opt.iterations:
         for dataset_index, viewpoint_cam in enumerate(gs_dataloader):
             if network_gui.conn == None:
@@ -116,39 +121,44 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-            ########## NOTE: training the model ###########
-            visibility_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe, bg)
-            gaussians_visible = gaussians.get_gs_param(visibility_mask)
-            with torch.cuda.amp.autocast(enabled=enable_tmp):
-                pred_gs = model([gaussians_visible])[0]
-            gaussians.tmp_update_gs_param(pred_gs)
-            ###############################################
+            if iteration > iteration_for_1stround:
+                ########## NOTE: training the model ###########
+                visibility_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe, bg)
+                # gaussians_visible = gaussians.get_gs_param(visibility_mask)
+                gaussians_visible = gaussians.get_all_gs_param()
+                with torch.cuda.amp.autocast(enabled=enable_tmp):
+                    pred_gs = model([gaussians_visible])[0]
+                gaussians.tmp_update_gs_param(pred_gs)
+                render_pkg = render_tmp(viewpoint_cam, gaussians, pipe, bg)
+                ###############################################
+            else:
+                render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
 
-            # render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
-            render_pkg = render_tmp(viewpoint_cam, gaussians, pipe, bg)
             image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
-            # # Loss
-            # # gt_image = viewpoint_cam.original_image.cuda()
-            # gt_image = viewpoint_cam.original_image
-            # Ll1 = l1_loss(image, gt_image)
-            # loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-            # loss.backward()
             ################# NOTE: adapting training #################
+            # Loss
+            # gt_image = viewpoint_cam.original_image.cuda()
             gt_image = viewpoint_cam.original_image
             Ll1 = l1_loss(image, gt_image)
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
             # Ll1 = (image - gt_image).abs().mean()
             # loss = Ll1 + lpips_loss_func(image.permute(1, 2, 0).unsqueeze(0), gt_image.permute(1, 2, 0).unsqueeze(0)).mean() + psnr(image.unsqueeze(0), gt_image.unsqueeze(0)).mean()
-            if enable_tmp:
-                scaler.scale(loss).backward()
-                scaler.step(model_optimizer)
-                scaler.update()
+            # loss.backward()
+            if iteration > iteration_for_1stround:
+                if enable_tmp:
+                    scaler.scale(loss).backward()
+                    scaler.step(model_optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    model_optimizer.step()
+                model_optimizer.zero_grad()
+                model_scheduler.step()
             else:
                 loss.backward()
-                model_optimizer.step()
-            model_optimizer.zero_grad()
-            model_scheduler.step()
+                gaussians.optimizer.step()
+                gaussians.optimizer.zero_grad(set_to_none = True)
             ###########################################################
 
             iter_end.record()
@@ -194,6 +204,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gaussians.tmp_remove_param()
             if iteration > opt.iterations:
                 break
+            
+            ### NOTE: to save the model ###
+            if iteration % 10000 == 0:
+                torch.save((model.state_dict(), iteration), "models/pt.pth")
+
 
 def prepare_output_and_logger(args):    
     if not args.model_path:

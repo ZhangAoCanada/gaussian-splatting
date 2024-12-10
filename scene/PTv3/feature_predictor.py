@@ -40,8 +40,9 @@ class FeaturePredictor(nn.Module):
                             "quats": nn.Identity()
                         },
                  max_scale_normalized=1e-2,
-                #  grid_resolution=6400,
-                 grid_resolution=9600,
+                #  grid_resolution=9600,
+                 grid_resolution=6400,
+                #  grid_resolution=128,
                 #  grid_resolution=384,
                  resume_ckpt=None,
                  input_embed_to_mlp=False,
@@ -130,9 +131,7 @@ class FeaturePredictor(nn.Module):
             batch_unnormalized_gs.append(unnormalized_gs)
         return  batch_unnormalized_gs
 
-    # def forward(self, batch_gs):
-    #     #1. Normalize
-    #     batch_normalized_gs, batch_scalers = self.normalized_gs(batch_gs) #Move to dataloader part
+
     def forward(self, batch_normalized_gs: List, **kwargs):
         ########## NOTE: normalization ########
         batch_normalized_gs, normalize_scaler = self.normalized_gs(batch_normalized_gs)
