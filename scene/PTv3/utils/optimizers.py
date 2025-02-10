@@ -2,15 +2,15 @@ import torch
 from scene.PTv3.feature_predictor import FeaturePredictor
 
 LR_DICT = {
-    "base": 1e-5, #Useless
-    "embedding": 1e-5,
-    "backbone": 1e-5,
-    "features_dc": 1e-5,
-    "features_rest": 1e-6,
-    "scales": 1e-5,
-    "opacities": 1e-5,
-    "quats": 1e-5,
-    "means": 1e-5
+    "base": 3e-5, #Useless
+    "embedding": 3e-5,
+    "backbone": 3e-5,
+    "features_dc": 3e-5,
+    "features_rest": 3e-6,
+    "scales": 3e-5,
+    "opacities": 3e-5,
+    "quats": 3e-5,
+    "means": 3e-5
 }
 
 def build_3DGSoptimizer(gs_params, 

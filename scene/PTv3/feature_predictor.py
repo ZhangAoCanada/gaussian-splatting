@@ -7,6 +7,10 @@ from .pointtransformer_v3 import PointTransformerV3Model
 from .spconv import SparseConvModel
 from typing import List
 
+from scene.octformer.octformerseg import OctFormerSeg
+from scene.octformer.octools import *
+from scene.octformer.gstransform import gsTransform
+
 
 
 FEATURE2CHANNEL = {
@@ -19,9 +23,11 @@ FEATURE2CHANNEL = {
 }
 ALL_FEATURES = ['means','features_dc','features_rest','opacities','scales','quats']
 
+
 class FeaturePredictor(nn.Module):
     def __init__(self, 
                  backbone_type="PT",
+                #  backbone_type="OCT",
                  sh_degree=1,
                  input_features=['means','scales', 'opacities', 'quats', 'features_dc', 'features_rest'],
                  input_feat_to_mlp=True,
@@ -31,8 +37,8 @@ class FeaturePredictor(nn.Module):
                  output_head_width=128,
                  output_features_type="res", # 'dc:direct component or res:residual"
                  res_feature_activation={
-                            "means":  nn.Tanh(),
-                            # "means":  nn.Identity(),
+                            # "means":  nn.Tanh(),
+                            "means":  nn.Identity(),
                             "features_dc": nn.Identity(),
                             "features_rest": nn.Identity(),
                             "scales": nn.Identity(),
@@ -40,9 +46,7 @@ class FeaturePredictor(nn.Module):
                             "quats": nn.Identity()
                         },
                  max_scale_normalized=1e-2,
-                #  grid_resolution=9600,
                  grid_resolution=6400,
-                #  grid_resolution=128,
                 #  grid_resolution=384,
                  resume_ckpt=None,
                  input_embed_to_mlp=False,
@@ -69,11 +73,24 @@ class FeaturePredictor(nn.Module):
 
         if backbone_type == 'SP':
             self.backbone = SparseConvModel(in_channels=in_channels)
+            head_input_dim = self.backbone.output_dim
+            self.scaler = [MinMaxScaler()]
         elif backbone_type == 'PT':
             self.backbone = PointTransformerV3Model(in_channels=in_channels)
+            self.normalized = True
+            head_input_dim = self.backbone.output_dim
+            self.scaler = [MinMaxScaler()]
+        elif backbone_type == "OCT":
+            self.backbone = OctFormerSeg(in_channels=in_channels, out_channels=in_channels)
+            self.transform = gsTransform(sh_degree)
+            self.input_feat_to_mlp = False
+            self.normalized = False
+            head_input_dim = self.backbone.fpn_channel
+            self.scaler = None
         else:
             raise NotImplementedError
-        head_input_dim = self.backbone.output_dim
+        if self.normalized:
+            self.res_feature_activation['means'] = nn.Tanh()
         if self.input_feat_to_mlp:
             head_input_dim += in_channels
 
@@ -100,12 +117,9 @@ class FeaturePredictor(nn.Module):
                 module[-1].bias.data.zero_()
     
     def normalized_gs(self, batch_gs):
-        scalers = []
         batch_normalized_gs = []
-        for gs in batch_gs:
+        for gs, scaler in zip(batch_gs, self.scaler):
             normalized_gs = {}
-            scaler = MinMaxScaler()
-            scaler.fit(gs['means'])
             for key in gs:
                 if key=='means':
                     normalized_gs['means'] = scaler.transform(gs['means']) 
@@ -113,13 +127,12 @@ class FeaturePredictor(nn.Module):
                     normalized_gs['scales'] = gs['scales'] + torch.log(scaler.scale_)
                 else:
                     normalized_gs[key] = gs[key]
-            scalers.append(scaler)
             batch_normalized_gs.append(normalized_gs)
-        return batch_normalized_gs, scalers
+        return batch_normalized_gs
 
-    def unnormalized_gs(self, batch_gs, scalers): #TODO
+    def unnormalized_gs(self, batch_gs):
         batch_unnormalized_gs = []
-        for gs, scaler in zip(batch_gs, scalers):
+        for gs, scaler in zip(batch_gs, self.scaler):
             unnormalized_gs = {}
             for key in gs:
                 if key=='means': #The predicted gs may not contain means
@@ -134,7 +147,8 @@ class FeaturePredictor(nn.Module):
 
     def forward(self, batch_normalized_gs: List, **kwargs):
         ########## NOTE: normalization ########
-        batch_normalized_gs, normalize_scaler = self.normalized_gs(batch_normalized_gs)
+        if self.backbone_type in ['PT','SP']:
+            batch_normalized_gs = self.normalized_gs(batch_normalized_gs)
         #######################################
         # start = time()
         device = batch_normalized_gs[0]['means'].device #It should be cuda
@@ -165,10 +179,17 @@ class FeaturePredictor(nn.Module):
                 'feat': feat,
             }
             model_input['grid_coord'] = torch.floor(model_input['coord']*self.grid_resolution).int() #[0~1]/
+            y = self.backbone(model_input)
+        elif self.backbone_type == 'OCT':
+            batch = self.transform(feat, normalized=self.normalized)
+            batch = process_batch(batch)
+            data = get_input_feature(batch['octree'])
+            octree, points = batch['octree'], batch['points']
+            batch_id = torch.zeros([points.points.shape[0], 1], device=device)
+            query_pts = torch.cat([points.points, batch_id], dim=1)
+            y = self.backbone(data, octree, octree.depth, query_pts)
         else:
             raise NotImplementedError
-
-        y = self.backbone(model_input)
 
         if self.backbone_type in ['PT']:
             y = y['feat']
@@ -193,9 +214,6 @@ class FeaturePredictor(nn.Module):
                 ###########################################################
                 # if feature == "scales":
                 #     feature_o_res = torch.nn.functional.tanh(feature_o_res)
-                #     # feature_o_res = torch.nn.functional.relu(feature_o_res) * -1
-                #     # feature_o_res = torch.nn.functional.mish(feature_o_res) * -1
-                #     # feature_o_res = torch.nn.functional.gelu(feature_o_res) * -1
                 ###########################################################
                 feature_o_res = self.res_feature_activation[feature](feature_o_res)
                 pointer += FEATURE2CHANNEL[feature]
@@ -203,13 +221,14 @@ class FeaturePredictor(nn.Module):
                     feature_o_res = feature_o_res.view(feature_o_res.shape[0], -1, 3)
                 ###########################################################
                 # if feature == "means":
+                #     feature_o_res = self.transform.inverse_transform(feature_o_res, normalized=self.normalized)
                 #     feature_o_res = feature_o_res * 0.1
                 ###########################################################
                 output[feature] = feature_o_res
 
         #-2. Unbatchify
         out_batch_normalized_gs = []
-        if self.backbone_type in ['PT','SP']:
+        if self.backbone_type in ['PT','SP','OCT']:
             left = 0
             for ii,(right, in_gs) in enumerate(zip(offset, batch_normalized_gs)):
                 out_normalized_gs = {}
@@ -229,7 +248,8 @@ class FeaturePredictor(nn.Module):
                     out_gs[key] = in_gs[key]
 
         ########## NOTE: unormalization ########
-        out_batch_normalized_gs = self.unnormalized_gs(out_batch_normalized_gs, normalize_scaler)
+        if self.backbone_type in ['PT','SP']:
+            out_batch_normalized_gs = self.unnormalized_gs(out_batch_normalized_gs)
         ########################################
 
         assert len(out_batch_normalized_gs) == 1, 'Now only support batch size 1'

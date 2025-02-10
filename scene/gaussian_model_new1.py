@@ -63,6 +63,7 @@ class GaussianModel:
         self._opacity_tmp = torch.empty(0)
         self._scaling_tmp = torch.empty(0)
         self._rotation_tmp = torch.empty(0)
+        self.optimizer_tmp = None
         #######################################################
         self.setup_functions()
 
@@ -205,7 +206,6 @@ class GaussianModel:
     def create_from_random(self, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = ((torch.rand((1000000, 3), device="cuda") - 0.5) * 2.0) * 200.
-        # fused_point_cloud = torch.randn((1000000, 3), device="cuda") * 200.
         fused_color = RGB2SH(torch.rand((1000000, 3), device="cuda"))
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0 ] = fused_color
@@ -227,15 +227,28 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
     
-    def get_gs_param(self, mask):
-        gs_dict = {
-            "means": self._xyz[mask].clone().detach().cuda(),
-            "features_dc": self._features_dc[mask].clone().detach().cuda(),
-            "features_rest": self._features_rest[mask].clone().detach().cuda(),
-            "opacities": self._opacity[mask].clone().detach().cuda(),
-            "scales": self._scaling[mask].clone().detach().cuda(),
-            "quats": self._rotation[mask].clone().detach().cuda()
-        }
+    def get_gs_param(self, mask, batch_size=100000000):
+        if mask.sum() <= batch_size:
+            gs_dict = {
+                "means": self._xyz[mask].clone().detach().cuda(),
+                "features_dc": self._features_dc[mask].clone().detach().cuda(),
+                "features_rest": self._features_rest[mask].clone().detach().cuda(),
+                "opacities": self._opacity[mask].clone().detach().cuda(),
+                "scales": self._scaling[mask].clone().detach().cuda(),
+                "quats": self._rotation[mask].clone().detach().cuda()
+            }
+        else:
+            # generate new random mask with batch_size num of True
+            mask2 = torch.zeros(mask.sum(), dtype=bool)
+            mask2[torch.randperm(mask.sum())[:batch_size]] = True
+            gs_dict ={
+                "means": self._xyz[mask][mask2].clone().detach().cuda(),
+                "features_dc": self._features_dc[mask][mask2].clone().detach().cuda(),
+                "features_rest": self._features_rest[mask][mask2].clone().detach().cuda(),
+                "opacities": self._opacity[mask][mask2].clone().detach().cuda(),
+                "scales": self._scaling[mask][mask2].clone().detach().cuda(),
+                "quats": self._rotation[mask][mask2].clone().detach().cuda()
+            }
         return gs_dict
     
     def get_all_gs_param(self, ):
@@ -249,6 +262,8 @@ class GaussianModel:
         }
         return gs_dict  
     
+    """*************************************************"""
+    """-------------------------------------------------"""
     def tmp_update_gs_param(self, gs_params):
         self._xyz_tmp = gs_params["means"]
         self._features_dc_tmp = gs_params["features_dc"]
@@ -268,9 +283,77 @@ class GaussianModel:
         self._scaling_tmp = torch.empty(0)
         self._rotation_tmp = torch.empty(0)
 
-    def merge_tmp_param(self, xyz_threshold=0.01):
+    """-------------------------------------------------"""
+    # def tmp_update_gs_param(self, gs_params, training_args):
+    #     if self._xyz_tmp.shape[0] == 0:
+    #         self._xyz_tmp = gs_params["means"]
+    #         self._features_dc_tmp = gs_params["features_dc"]
+    #         self._features_rest_tmp = gs_params["features_rest"]
+    #         scales = torch.log(torch.rand((self._xyz_tmp.shape[0], 3), device="cuda") * 1 + 0.0001)
+    #         rots = torch.zeros((self._xyz_tmp.shape[0], 4), device="cuda")
+    #         rots[:, 0] = 1
+    #         opacities = inverse_sigmoid(0.1 * torch.ones((self._xyz_tmp.shape[0], 1), dtype=torch.float, device="cuda"))
+    #         self._opacity_tmp = nn.Parameter(opacities.requires_grad_(True))
+    #         self._scaling_tmp = nn.Parameter(scales.requires_grad_(True))
+    #         self._rotation_tmp = nn.Parameter(rots.requires_grad_(True))
+
+    #         l = [{'params': [self._opacity_tmp], 'lr': training_args.opacity_lr, "name": "opacity"},
+    #             {'params': [self._scaling_tmp], 'lr': training_args.scaling_lr, "name": "scaling"},
+    #             {'params': [self._rotation_tmp], 'lr': training_args.rotation_lr, "name": "rotation"}]
+    #         self.optimizer_tmp = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+
+    #     else:
+    #         del self._xyz_tmp, self._features_dc_tmp, self._features_rest_tmp
+    #         self._xyz_tmp = gs_params["means"]
+    #         self._features_dc_tmp = gs_params["features_dc"]
+    #         self._features_rest_tmp = gs_params["features_rest"]
+
+    # def tmp_remove_param(self):
+    #     if self._xyz_tmp.shape[0] == 0:
+    #         return
+    #     self._xyz_tmp = self._xyz_tmp.detach().clone()
+    #     self._features_dc_tmp = self._features_dc_tmp.detach().clone()
+    #     self._features_rest_tmp = self._features_rest_tmp.detach().clone()
+
+    """-------------------------------------------------"""
+    def tmp_update_gs_param_vis(self, gs_params, training_args, mask):
+        if self._xyz_tmp.shape[0] == 0:
+            self._xyz_tmp = self._xyz.data.detach().clone()
+            self._features_dc_tmp = self._features_dc.data.detach().clone()
+            self._features_rest_tmp = self._features_rest.data.detach().clone()
+            self._opacity_tmp = self._opacity.data.detach().clone() 
+            self._scaling_tmp = self._scaling.data.detach().clone()
+            self._rotation_tmp = self._rotation.data.detach().clone()
+        self._xyz_tmp[mask] = gs_params["means"]
+        self._features_dc_tmp[mask] = gs_params["features_dc"]
+        self._features_rest_tmp[mask] = gs_params["features_rest"]
+        self._opacity_tmp[mask] = gs_params["opacities"]
+        self._scaling_tmp[mask] = gs_params["scales"]
+        self._rotation_tmp[mask] = gs_params["quats"]
+
+    def tmp_remove_param_vis(self, mask):
+        if self._xyz_tmp.shape[0] == 0 or mask is None:
+            return
+        _xyz_tmp = self._xyz_tmp.detach().clone()
+        _features_dc_tmp = self._features_dc_tmp.detach().clone()
+        _features_rest_tmp = self._features_rest_tmp.detach().clone()
+        _opacity_tmp = self._opacity_tmp.detach().clone()
+        _scaling_tmp = self._scaling_tmp.detach().clone()
+        _rotation_tmp = self._rotation_tmp.detach().clone()
+        self._xyz_tmp = _xyz_tmp
+        self._features_dc_tmp = _features_dc_tmp
+        self._features_rest_tmp = _features_rest_tmp
+        self._opacity_tmp = _opacity_tmp
+        self._scaling_tmp = _scaling_tmp
+        self._rotation_tmp = _rotation_tmp
+    """-------------------------------------------------"""
+    """*************************************************"""
+
+    def merge_tmp_param(self, vis_mask=None, xyz_threshold=0.01):
+        if vis_mask == None:
+            vis_mask = torch.ones((self._xyz.shape[0]), device="cuda", dtype=bool)
         mask = torch.zeros((self._xyz_tmp.shape[0]), device="cuda", dtype=bool)
-        distance = torch.norm(self._xyz_tmp - self._xyz, dim=1)
+        distance = torch.norm(self._xyz_tmp - self._xyz[vis_mask], dim=1)
         mask = torch.where(distance > xyz_threshold, True, False)
         new_xyz = self._xyz_tmp.detach().clone()[mask]
         new_features_dc = self._features_dc_tmp.detach().clone()[mask]
@@ -279,7 +362,14 @@ class GaussianModel:
         new_scaling = self._scaling_tmp.detach().clone()[mask]
         new_rotation = self._rotation_tmp.detach().clone()[mask]
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
-
+        del self._xyz_tmp, self._features_dc_tmp, self._features_rest_tmp, self._opacity_tmp, self._scaling_tmp, self._rotation_tmp, self.optimizer_tmp
+        self._xyz_tmp = torch.empty(0)
+        self._features_dc_tmp = torch.empty(0)
+        self._features_rest_tmp = torch.empty(0)
+        self._opacity_tmp = torch.empty(0)
+        self._scaling_tmp = torch.empty(0)
+        self._rotation_tmp = torch.empty(0)
+        self.optimizer_tmp = None
     ######################################################################
     ######################################################################
     ######################################################################

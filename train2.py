@@ -40,6 +40,19 @@ from scene.PTv3.utils import loss_utils
 #########################################
 
 
+LR_DICT = {
+    "base": 3e-5, #Useless
+    "embedding": 3e-5,
+    "backbone": 3e-5,
+    "features_dc": 3e-5,
+    "features_rest": 3e-6,
+    "scales": 3e-5,
+    "opacities": 3e-5,
+    "quats": 3e-5,
+    "means": 3e-5
+}
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, enable_tmp=True):
     enable_tmp = True
     first_iter = 0
@@ -51,16 +64,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gs_testset = GSDataset(scene.getTestCameraInfos(), dataset)
     gs_testloader = CacheDataLoader(gs_testset, max_cache_num=16, seed=42, shuffle=False, num_workers=8, batch_size=1)
     ######## NOTE: build model ###########
-    model = FeaturePredictor(sh_degree=dataset.sh_degree)
+    model = FeaturePredictor(backbone_type="PT", sh_degree=dataset.sh_degree) # "OCT" or "PT"
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    # model_path = "models/ptv3_50k.pth"
-    model_path = "models/ptv3_combine60k.pth"
+    model_path = f"models/{model.backbone_type}_allpnts.pth"
+    model_save_path = f"models/{model.backbone_type}_allpnts.pth"
     if os.path.exists(model_path):
         model.load_state_dict(torch.load(model_path, map_location="cpu")[0])
         print("[INFO] Load model from {}".format(model_path))
     model = model.cuda()
     model.train()
-    model_optimizer = build_optimizer(model)
+    if model.backbone_type == "OCT":
+        enable_tmp = False
+        LR_DICT["backbone"] = 1e-3 # NOTE: change lr for backbone
+    model_optimizer = build_optimizer(model, lr_dict=LR_DICT)
     model_scheduler = build_scheduler(model_optimizer, opt.iterations)
     if enable_tmp:
         scaler = torch.cuda.amp.GradScaler()
@@ -68,6 +84,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     else:
         torch.autograd.set_detect_anomaly(False)
     lpips_loss_func = loss_utils.lpips_loss_fn()
+    if model.scaler != None:
+        print("=========== Points will be normalized to [-1, 1] ==========")
+        if not model.scaler[0].already_scaled:
+            model.scaler[0].fit(gaussians.get_xyz)
     ######################################
     gaussians.training_setup(opt)
     if checkpoint:
@@ -84,10 +104,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
-    # for iteration in range(first_iter, opt.iterations + 1):        
     iteration = first_iter
     gs_train_iter = 5000
-    net_train_iter = 5000
+    net_train_iter = 50000000
+    visibility_mask = None
     while iteration <= opt.iterations:
         for dataset_index, viewpoint_cam in enumerate(gs_dataloader):
             if network_gui.conn == None:
@@ -107,13 +127,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             
             ################ NOTE: merge attributes ################
             if iteration > 0 and iteration % (gs_train_iter + net_train_iter) == 0:
-                gaussians.merge_tmp_param()
-            gaussians.tmp_remove_param()
-            # if iteration % (gs_train_iter + net_train_iter) <= gs_train_iter:
-            #     model.eval()
-            # else:
-            #     model.train()
-            ########################################################
+                # gaussians.merge_tmp_param(vis_mask=visibility_mask, xyz_threshold=0.01)
+                gaussians.merge_tmp_param(xyz_threshold=0.01)
+            if model.backbone_type == "PT":
+                gaussians.tmp_remove_param()
+                # gaussians.tmp_remove_param_vis(visibility_mask)
+            elif model.backbone_type == "OCT":
+                gaussians.tmp_remove_param_vis(visibility_mask)
+            else:
+                raise NotImplementedError
+            if iteration % (gs_train_iter + net_train_iter) == gs_train_iter or iteration % (gs_train_iter + net_train_iter) == 0:
+                torch.cuda.empty_cache()
 
             iter_start.record()
 
@@ -122,11 +146,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Every 1000 its we increase the levels of SH up to a maximum degree
             if iteration % 1000 == 0:
                 gaussians.oneupSHdegree()
-
-            # # Pick a random Camera
-            # if not viewpoint_stack:
-            #     viewpoint_stack = scene.getTrainCameras().copy()
-            # viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
             # Render
             if (iteration - 1) == debug_from:
@@ -137,21 +156,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ############### NOTE: training the model ################
             if iteration % (gs_train_iter + net_train_iter) > gs_train_iter:
                 visibility_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe, bg)
-                # gaussians_visible = gaussians.get_gs_param(visibility_mask)
-                gaussians_visible = gaussians.get_all_gs_param()
+                if model.backbone_type == "PT":
+                    gaussians_visible = gaussians.get_all_gs_param()
+                    # gaussians_visible = gaussians.get_gs_param(visibility_mask)
+                elif model.backbone_type == "OCT":
+                    gaussians_visible = gaussians.get_gs_param(visibility_mask)
+                else:
+                    raise NotImplementedError
                 with torch.cuda.amp.autocast(enabled=enable_tmp):
                     pred_gs = model([gaussians_visible])[0]
-                gaussians.tmp_update_gs_param(pred_gs)
+                if model.backbone_type == "PT":
+                    gaussians.tmp_update_gs_param(pred_gs)
+                    # gaussians.tmp_update_gs_param_vis(pred_gs, opt, visibility_mask)
+                elif model.backbone_type == "OCT":
+                    gaussians.tmp_update_gs_param_vis(pred_gs, opt, visibility_mask)
+                else:
+                    raise NotImplementedError
                 render_pkg = render_tmp(viewpoint_cam, gaussians, pipe, bg)
             else:
                 render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
-            #########################################################
 
             image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
             ################# NOTE: adapting training #################
-            # Loss
-            # gt_image = viewpoint_cam.original_image.cuda()
             gt_image = viewpoint_cam.original_image
             Ll1 = l1_loss(image, gt_image)
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
@@ -168,6 +195,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     model_optimizer.step()
                 model_optimizer.zero_grad()
                 model_scheduler.step()
+
+                # gaussians.optimizer.step()
+                # gaussians.optimizer.zero_grad(set_to_none = True)
+                if gaussians.optimizer_tmp != None:
+                    gaussians.optimizer_tmp.step()
+                    gaussians.optimizer_tmp.zero_grad(set_to_none = True)
+
             else:
                 loss.backward()
                 gaussians.optimizer.step()
@@ -219,7 +253,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             
             ### NOTE: to save the model ###
             if iteration % 10000 == 0:
-                torch.save((model.state_dict(), iteration), "models/pt.pth")
+                torch.save((model.state_dict(), iteration), model_save_path)
 
 
 def prepare_output_and_logger(args):    
